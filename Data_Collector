@@ -1,0 +1,571 @@
+import sys
+import struct
+import time
+import ctypes
+import os
+import multiprocessing as mp
+import numpy as np
+import scipy.signal as signal
+import RPi.GPIO as GPIO
+
+from PySide6.QtCore    import Qt, QTimer
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, \
+                              QVBoxLayout, QHBoxLayout, QLabel, \
+                              QComboBox, QSlider, QGridLayout, \
+                              QPushButton, QProgressBar, QInputDialog
+import pyqtgraph as pg
+
+# ──────────────────────────────────────────────────────────────
+#  Constants
+# ──────────────────────────────────────────────────────────────
+CONVST      = 18          
+BUSY        = 27
+RESET       = 24
+
+SAMPLING_RATE             = 6000          
+RAW_BUFFER_CAPACITY       = 18000         
+PROCESSED_BUFFER_CAPACITY = 6000          
+MAX_DISPLAY               = 2000          
+
+# Phase 1 Adjustments
+NUM_CHANNELS      = 5   
+SAMPLES_PER_ROUND = 156425
+IGNORE_SAMPLES    = 5000
+MOVEMENT_COUNT    = 8
+
+PLOT_FPS        = 30            
+PLOT_INTERVAL   = 1000 // PLOT_FPS   
+
+VREF             = 5.0               
+BYTES_PER_SAMPLE = 16           
+
+# ──────────────────────────────────────────────────────────────
+#  HDF5 Storage Engine (Phase 2)
+# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+#  HDF5 Storage Engine (Phase 2)
+# ──────────────────────────────────────────────────────────────
+def init_h5_file(filepath, name, age):
+    import h5py  # <--- الاستيراد يتم هنا فقط لحظة إنشاء الملف
+    with h5py.File(filepath, 'w') as f:
+        f.attrs['Subject_Name'] = name
+        f.attrs['Subject_Age'] = age
+        f.create_dataset('sEMG_Data',
+                         shape=(0, 6),
+                         maxshape=(None, 6),
+                         dtype='float32',
+                         chunks=(2000, 6))
+
+def append_to_h5(filepath, chunk_data_5ch, movement_label):
+    import h5py  # <--- الاستيراد يتم هنا فقط لحظة الكتابة
+    if chunk_data_5ch.shape[0] == 0:
+        return
+    N = chunk_data_5ch.shape[0]
+    labels = np.full((N, 1), movement_label, dtype=np.float32)
+    data_to_append = np.hstack((chunk_data_5ch, labels))
+
+    with h5py.File(filepath, 'a') as f:
+        dataset = f['sEMG_Data']
+        current_size = dataset.shape[0]
+        dataset.resize((current_size + N, 6))
+        dataset[current_size:] = data_to_append
+
+# ──────────────────────────────────────────────────────────────
+#  Shared Memory Ring Buffer (Tear-Free)
+# ──────────────────────────────────────────────────────────────
+class SharedRingBuffer:
+    def __init__(self, size: int):
+        self._size = size
+        self._buf = mp.Array(ctypes.c_float, size, lock=False)
+        self._head = mp.Value(ctypes.c_int, 0, lock=False)
+
+    def append(self, value: float):
+        h = self._head.value
+        self._buf[h] = value
+        self._head.value = (h + 1) % self._size
+
+    def extend(self, values: np.ndarray):
+        h = self._head.value
+        n = len(values)
+        if n == 0: return
+        snapshot = np.frombuffer(self._buf, dtype=np.float32)
+        
+        if h + n <= self._size:
+            snapshot[h:h+n] = values
+        else:
+            overflow = (h + n) % self._size
+            snapshot[h:] = values[:self._size - h]
+            snapshot[:overflow] = values[self._size - h:]
+            
+        self._head.value = (h + n) % self._size
+
+    def read_latest(self, count: int) -> np.ndarray:
+        h = self._head.value
+        safe_head = (h - 2) % self._size
+        
+        snapshot = np.frombuffer(self._buf, dtype=np.float32)
+        
+        if safe_head >= count:
+            return snapshot[safe_head - count : safe_head].copy()
+        else:
+            part1 = snapshot[self._size - (count - safe_head):]
+            part2 = snapshot[:safe_head]
+            return np.concatenate((part1, part2))
+
+    def read_forward(self, start_idx: int, count: int) -> np.ndarray:
+        snapshot = np.frombuffer(self._buf, dtype=np.float32)
+        if start_idx + count <= self._size:
+            return snapshot[start_idx : start_idx + count].copy()
+        else:
+            part1 = snapshot[start_idx:]
+            part2 = snapshot[: (start_idx + count) % self._size]
+            return np.concatenate((part1, part2))
+
+# ──────────────────────────────────────────────────────────────
+#  1. Acquisition Process (Hardware Level - 6000 Hz)
+# ──────────────────────────────────────────────────────────────
+def acquisition_worker(raw_buffers, sample_count, running_flag):
+    import spidev
+    import pigpio  
+    import RPi.GPIO as GPIO
+    
+    try:
+        os.sched_setaffinity(0, {3})
+        param = os.sched_param(99)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+    except PermissionError:
+        print("\n[تحذير خطير]: عملية القراءة لم تأخذ الأولوية القصوى! يجب تشغيل السكريبت بـ sudo لضمان ثبات السامبلينج.\n")
+    except Exception as e:
+        pass 
+        
+    os.system("sudo taskset -cp 3 $(pgrep pigpiod) > /dev/null 2>&1")
+    
+    pi = pigpio.pi()
+    if not pi.connected:
+        print("[خطأ جسيم]: خدمة pigpio لا تعمل! تأكد من تنفيذ الأمر: sudo systemctl start pigpiod")
+        running_flag.value = False
+        return
+
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(RESET, GPIO.OUT)
+    GPIO.setup(BUSY, GPIO.IN)
+
+    spi = spidev.SpiDev()
+    spi.open(0, 0)
+    spi.max_speed_hz = 10_000_000 
+    spi.mode = 0b10
+
+    GPIO.output(RESET, GPIO.HIGH)
+    time.sleep(0.001)
+    GPIO.output(RESET, GPIO.LOW)
+
+    _UNPACK = struct.Struct('>8h')
+
+    pi.hardware_PWM(CONVST, SAMPLING_RATE, 500000)
+
+    while running_flag.value:
+        while GPIO.input(BUSY) == GPIO.LOW:
+            if not running_flag.value: break
+             
+        while GPIO.input(BUSY) == GPIO.HIGH:
+            pass 
+
+        raw_data = spi.readbytes(BYTES_PER_SAMPLE)
+        ch_raw = _UNPACK.unpack(bytes(raw_data))
+        
+        for ch in range(NUM_CHANNELS): 
+            v = (ch_raw[ch] / 32768.0) * VREF
+            raw_buffers[ch].append(v)
+
+        sample_count.value += 1
+
+    pi.hardware_PWM(CONVST, 0, 0) 
+    pi.stop()                     
+    spi.close()
+    GPIO.cleanup()
+
+# ──────────────────────────────────────────────────────────────
+#  2. DSP Process (Preprocessing & Decimation Bridge)
+# ──────────────────────────────────────────────────────────────
+def dsp_worker(raw_buffers, processed_buffers, running_flag):
+    import os
+    try:
+        os.sched_setaffinity(0, {2})
+        param = os.sched_param(98)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+    except PermissionError:
+        print("\n[تحذير خطير]: عملية الفلترة لم تأخذ الأولوية القصوى! يرجى استخدام sudo.\n")
+    except Exception:
+        pass
+
+    raw_size = raw_buffers[0]._size
+    last_heads = [0] * NUM_CHANNELS
+    
+    fs = float(SAMPLING_RATE)
+    
+    # Notch filter Q modified to 20.0
+    b_notch, a_notch = signal.iirnotch(50.0, 2.0, fs=fs)
+    sos_notch = signal.tf2sos(b_notch, a_notch)
+    zi_notch_base = signal.sosfilt_zi(sos_notch)
+    
+    sos_bp = signal.butter(4, [20.0, 500.0], btype='bandpass', fs=fs, output='sos')
+    zi_bp_base = signal.sosfilt_zi(sos_bp)
+    
+    zi_notch_states = [None] * NUM_CHANNELS
+    zi_bp_states = [None] * NUM_CHANNELS
+    filters_initialized = [False] * NUM_CHANNELS
+
+    while running_flag.value:
+        for ch in range(NUM_CHANNELS):
+            current_head = raw_buffers[ch]._head.value
+            last_head = last_heads[ch]
+            
+            if current_head == last_head:
+                continue
+                
+            if current_head > last_head:
+                new_count = current_head - last_head
+            else:
+                new_count = raw_size - last_head + current_head
+                
+            remainder = new_count % 3
+            processed_count = new_count - remainder
+            
+            if processed_count > 0:
+                raw_snap = np.frombuffer(raw_buffers[ch]._buf, dtype=np.float32)
+                
+                if last_head + processed_count <= raw_size:
+                    chunk = raw_snap[last_head : last_head + processed_count].copy()
+                else:
+                    overflow = (last_head + processed_count) % raw_size
+                    chunk = np.concatenate((raw_snap[last_head:], raw_snap[:overflow]))
+                    
+                chunk_64 = chunk.astype(np.float64)
+
+                if not filters_initialized[ch]:
+                    zi_notch_states[ch] = zi_notch_base * chunk_64[0]
+                    zi_bp_states[ch] = zi_bp_base * chunk_64[0]
+                    filters_initialized[ch] = True
+
+                filtered_chunk_notch, zi_notch_states[ch] = signal.sosfilt(sos_notch, chunk_64, zi=zi_notch_states[ch])
+                filtered_chunk_final, zi_bp_states[ch] = signal.sosfilt(sos_bp, filtered_chunk_notch, zi=zi_bp_states[ch])
+                
+                filtered_chunk = filtered_chunk_final.astype(np.float32)
+                decimated_chunk = filtered_chunk[::3]
+                processed_buffers[ch].extend(decimated_chunk)
+                
+                last_heads[ch] = (last_head + processed_count) % raw_size
+                
+        time.sleep(0.005)
+
+# ──────────────────────────────────────────────────────────────
+#  3. Main GUI Window
+# ──────────────────────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AD7606 — sEMG Dataset Collection System")
+        self.resize(1100, 600)
+
+        self._raw_buffers = [SharedRingBuffer(RAW_BUFFER_CAPACITY) for _ in range(NUM_CHANNELS)]
+        self._processed_buffers = [SharedRingBuffer(PROCESSED_BUFFER_CAPACITY) for _ in range(NUM_CHANNELS)]
+        
+        self._active_ch = 0
+        
+        # State Machine Variables
+        self._h5_filepath = None
+        self._is_recording = False
+        self._current_round = 1
+        self._ignored_count = 0
+        self._saved_count = 0
+        self._completed_movements = set()
+        self._last_read_heads = [0] * NUM_CHANNELS
+        
+        self._sample_count = mp.Value(ctypes.c_int, 0, lock=False)
+        self._running_flag = mp.Value(ctypes.c_bool, True, lock=False)
+
+        pg.setConfigOption('background', '#1a1a2e')
+        pg.setConfigOption('foreground', '#e0e0e0')
+
+        central = QWidget() 
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        
+        # --- Control Panel ---
+        ctrl_layout = QGridLayout()
+        
+        lbl_ch = QLabel("Channel:")
+        self._combo = QComboBox()
+        for i in range(NUM_CHANNELS):
+            self._combo.addItem(f"CH {i}")
+        self._combo.currentIndexChanged.connect(self._on_channel_changed)
+        
+        lbl_x = QLabel("X-Scale (Time Base):")
+        self._x_slider = QSlider(Qt.Horizontal)
+        self._x_slider.setRange(100, MAX_DISPLAY) 
+        self._x_slider.setValue(1000) 
+        self._x_slider.valueChanged.connect(self._update_plot_ranges)
+
+        lbl_y = QLabel("Y-Scale (Voltage):")
+        self._y_slider = QSlider(Qt.Horizontal)
+        self._y_slider.setRange(1, 50) 
+        self._y_slider.setValue(50)    
+        self._y_slider.valueChanged.connect(self._update_plot_ranges)
+
+        self._rate_lbl = QLabel("0 Hz (Raw HW)")
+        self._rate_lbl.setStyleSheet("color:#50fa7b; font-weight:bold; font-size:14px;")
+
+        # --- Dataset Collection UI ---
+        self._new_subject_btn = QPushButton("New Subject")
+        self._new_subject_btn.clicked.connect(self._on_new_subject)
+
+        self._combo_movement = QComboBox()
+        for i in range(1, MOVEMENT_COUNT + 1):
+            self._combo_movement.addItem(f"Movement {i}")
+        self._combo_movement.currentIndexChanged.connect(self._on_movement_changed)
+
+        self._record_btn = QPushButton("Record M1 - R1")
+        self._record_btn.setEnabled(False)
+        self._record_btn.clicked.connect(self._on_record_clicked)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, SAMPLES_PER_ROUND)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(True)
+
+        # Layout Assembly
+        ctrl_layout.addWidget(lbl_ch, 0, 0)
+        ctrl_layout.addWidget(self._combo, 0, 1)
+        ctrl_layout.addWidget(lbl_x, 0, 2)
+        ctrl_layout.addWidget(self._x_slider, 0, 3)
+        ctrl_layout.addWidget(self._rate_lbl, 0, 4, 1, 2, Qt.AlignRight | Qt.AlignVCenter)
+
+        ctrl_layout.addWidget(lbl_y, 1, 0)
+        ctrl_layout.addWidget(self._y_slider, 1, 1)
+        ctrl_layout.addWidget(self._new_subject_btn, 1, 2)
+        ctrl_layout.addWidget(self._combo_movement, 1, 3)
+        ctrl_layout.addWidget(self._record_btn, 1, 4, 1, 2)
+
+        ctrl_layout.addWidget(self._progress_bar, 2, 0, 1, 6)
+        
+        root.addLayout(ctrl_layout)
+
+        # --- Plot Area ---
+        self._plot_widget = pg.PlotWidget()
+        self._plot_widget.setLabel('left',  'Voltage', units='V')
+        self._plot_widget.setLabel('bottom', 'Samples (Processed @ 2000Hz)')
+        self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_widget.setMouseEnabled(x=False, y=False) 
+        
+        self._curve = self._plot_widget.plot(pen=pg.mkPen(color='#8be9fd', width=1.8)) 
+        root.addWidget(self._plot_widget)
+
+        # Start Multiprocessing
+        self._acq_process = mp.Process(target=acquisition_worker, 
+                                       args=(self._raw_buffers, self._sample_count, self._running_flag))
+        self._dsp_process = mp.Process(target=dsp_worker, 
+                                       args=(self._raw_buffers, self._processed_buffers, self._running_flag))
+        
+        self._acq_process.start()
+        self._dsp_process.start()
+
+        # Timers
+        self._plot_timer = QTimer(self)
+        self._plot_timer.setInterval(PLOT_INTERVAL)
+        self._plot_timer.timeout.connect(self._refresh_plot)
+        self._plot_timer.start()
+
+        self._rate_timer = QTimer(self)
+        self._rate_timer.setInterval(1000)
+        self._rate_timer.timeout.connect(self._update_rate) 
+        self._rate_timer.start()
+
+        self._record_timer = QTimer(self)
+        self._record_timer.setInterval(100)
+        self._record_timer.timeout.connect(self._recording_loop)
+        self._record_timer.start()
+
+        self._x = np.arange(MAX_DISPLAY, dtype=np.float32)
+        self._update_plot_ranges() 
+
+    # --- Dataset Control Logic ---
+# --- Dataset Control Logic ---
+    def _on_new_subject(self):
+        from PySide6.QtWidgets import QMessageBox
+
+        # لو مفيش ملف شغال، يبقى إحنا بنعمل شخص جديد
+        if self._h5_filepath is None:
+            name, ok1 = QInputDialog.getText(self, "New Subject", "Enter Subject Name:")
+            if not ok1 or not name.strip(): return
+
+            age, ok2 = QInputDialog.getInt(self, "New Subject", "Enter Subject Age:", min=1, max=120)
+            if not ok2: return
+
+            self._h5_filepath = f"Subject_{name.strip().replace(' ', '_')}_{int(time.time())}.h5"
+            init_h5_file(self._h5_filepath, name, age)
+
+            # تغيير شكل الزرار ليصبح زرار إغلاق أحمر
+            self._new_subject_btn.setText("Save Data / Close File")
+            self._new_subject_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold;")
+            self._combo_movement.setEnabled(True)
+            self._on_movement_changed() 
+            
+        # لو في ملف شغال، يبقى إحنا عايزين نقفله ونحفظ
+        else:
+            reply = QMessageBox.question(self, "Confirm Close", "Are you sure you want to lock and close this dataset?", QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                # تصفير كل المتغيرات لتهيئتها لشخص جديد
+                self._h5_filepath = None
+                self._completed_movements.clear()
+                self._current_round = 1
+                self._is_recording = False
+                
+                # إرجاع الواجهة الرسومية لوضعها الأصلي
+                self._new_subject_btn.setText("New Subject")
+                self._new_subject_btn.setStyleSheet("")
+                self._combo_movement.setEnabled(True)
+                self._record_btn.setEnabled(False)
+                self._record_btn.setText("Record M1 - R1")
+                self._progress_bar.setValue(0)
+
+
+    def _on_movement_changed(self):
+        mov_idx = self._combo_movement.currentIndex() + 1
+        if mov_idx in self._completed_movements:
+            self._record_btn.setText(f"Movement {mov_idx} Completed")
+            self._record_btn.setEnabled(False)
+        else:
+            self._current_round = 1
+            self._record_btn.setText(f"Record M{mov_idx} - R1")
+            self._record_btn.setEnabled(self._h5_filepath is not None)
+
+    def _on_record_clicked(self):
+        if self._h5_filepath is None: return
+
+        for ch in range(NUM_CHANNELS):
+            self._last_read_heads[ch] = self._processed_buffers[ch]._head.value
+
+        self._ignored_count = 0
+        self._saved_count = 0
+        self._progress_bar.setValue(0)
+        self._is_recording = True
+
+        self._record_btn.setEnabled(False)
+        self._combo_movement.setEnabled(False)
+
+    def _recording_loop(self):
+        if not self._is_recording:
+            return
+
+        counts = []
+        for ch in range(NUM_CHANNELS):
+            h = self._processed_buffers[ch]._head.value
+            last = self._last_read_heads[ch]
+            size = self._processed_buffers[ch]._size
+            count = h - last if h >= last else size - last + h
+            counts.append(count)
+
+        min_count = min(counts)
+        if min_count == 0:
+            return
+
+        channels_data = []
+        for ch in range(NUM_CHANNELS):
+            data = self._processed_buffers[ch].read_forward(self._last_read_heads[ch], min_count)
+            channels_data.append(data)
+            self._last_read_heads[ch] = (self._last_read_heads[ch] + min_count) % self._processed_buffers[ch]._size
+
+        chunk_data_5ch = np.column_stack(channels_data)
+        mov_label = self._combo_movement.currentIndex() + 1
+
+        if self._ignored_count < IGNORE_SAMPLES:
+            remaining_ignore = IGNORE_SAMPLES - self._ignored_count
+            ignore_now = min(remaining_ignore, min_count)
+            self._ignored_count += ignore_now
+            chunk_data_5ch = chunk_data_5ch[ignore_now:]
+            min_count -= ignore_now
+
+        if min_count == 0:
+            return
+
+        remaining_save = SAMPLES_PER_ROUND - self._saved_count
+        save_now = min(remaining_save, min_count)
+        data_to_save = chunk_data_5ch[:save_now]
+
+        append_to_h5(self._h5_filepath, data_to_save, mov_label)
+        
+        self._saved_count += save_now
+        self._progress_bar.setValue(self._saved_count)
+
+        if self._saved_count >= SAMPLES_PER_ROUND:
+            self._is_recording = False
+            if self._current_round == 1:
+                self._current_round = 2
+                self._record_btn.setText(f"Record M{mov_label} - R2")
+                self._record_btn.setEnabled(True)
+            else:
+                self._completed_movements.add(mov_label)
+                self._combo_movement.setEnabled(True)
+                self._on_movement_changed() 
+
+    # --- Plot UI Updates ---
+    def _update_plot_ranges(self):
+        x_max = self._x_slider.value()
+        y_max = self._y_slider.value() / 10.0 
+        
+        self._plot_widget.setXRange(0, x_max, padding=0)
+        self._plot_widget.setYRange(-y_max, y_max, padding=0)
+
+    def _refresh_plot(self):
+        data = self._processed_buffers[self._active_ch].read_latest(MAX_DISPLAY + 500)
+        
+        dc_offset = np.mean(data)
+        crossings = np.where((data[:-1] < dc_offset) & (data[1:] >= dc_offset))[0]
+        
+        valid_crossings = [c for c in crossings if (len(data) - c) >= MAX_DISPLAY]
+        
+        if valid_crossings:
+            trig_idx = valid_crossings[-1]
+            plot_data = data[trig_idx : trig_idx + MAX_DISPLAY]
+        else:
+            plot_data = data[-MAX_DISPLAY:]
+
+        self._curve.setData(self._x, plot_data) 
+
+    def _on_channel_changed(self, idx: int):
+        self._active_ch = idx
+
+    def _update_rate(self):
+        hz = self._sample_count.value
+        self._sample_count.value = 0
+        self._rate_lbl.setText(f"{hz} Hz (Raw HW)")
+
+    def closeEvent(self, event):
+        self._plot_timer.stop()
+        self._rate_timer.stop()
+        self._record_timer.stop()
+        self._running_flag.value = False
+        self._acq_process.join(timeout=1.0)
+        self._dsp_process.join(timeout=1.0)
+        event.accept()
+
+# ──────────────────────────────────────────────────────────────
+#  Entry Point
+# ──────────────────────────────────────────────────────────────
+def main():
+    try:
+        os.sched_setaffinity(0, {0, 1})
+    except Exception:
+        pass
+
+    mp.freeze_support()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = MainWindow()
+    win.show()
+    exit_code = app.exec()
+    sys.exit(exit_code)
+
+if __name__ == "__main__":
+    main()
