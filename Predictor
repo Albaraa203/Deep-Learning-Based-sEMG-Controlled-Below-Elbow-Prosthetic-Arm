@@ -1,0 +1,578 @@
+import sys
+import struct
+import time
+import ctypes
+import os
+import multiprocessing as mp
+import numpy as np
+import scipy.signal as signal
+import RPi.GPIO as GPIO
+import gc
+import joblib
+import collections
+
+from PySide6.QtCore    import Qt, QTimer
+from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, \
+                              QVBoxLayout, QHBoxLayout, QLabel, \
+                              QComboBox, QSlider, QGridLayout
+from PySide6.QtGui     import QFont
+import pyqtgraph as pg
+
+# ──────────────────────────────────────────────────────────────
+#  Global Settings & Constants
+# ──────────────────────────────────────────────────────────────
+CONVST      = 18          
+BUSY        = 27
+RESET       = 24
+
+SAMPLING_RATE             = 6000          
+RAW_BUFFER_CAPACITY       = 18000         
+PROCESSED_BUFFER_CAPACITY = 6000          
+MAX_DISPLAY               = 2000          
+
+NUM_CHANNELS = 5   
+TARGET_CHANNELS_IDX = [1, 2, 4]  # CH2, CH3, CH5 (Zero-indexed)
+
+PLOT_FPS      = 30            
+PLOT_INTERVAL = 1000 // PLOT_FPS   
+
+VREF             = 5.0               
+BYTES_PER_SAMPLE = 16           
+
+# 🔴 Machine Learning Configurations 🔴
+MODEL_FILE  = "model.pkl"
+SCALER_FILE = "standard_scaler.pkl"
+INFERENCE_WINDOW_SIZE = 400
+
+MEAN_SCALE = 0.539738
+
+RMS_THRESH_CH1 = 0.023
+RMS_THRESH_CH2 = 0.033
+RMS_THRESH_CH3 = 0.023
+
+# 🔴 Post-Processing Kinematic Smoothing Configurations 🔴
+VOTING_WINDOW_SEC = 0.6
+COOLDOWN_SEC = 1.0
+STABILITY_THRESHOLD = 0.5
+
+# ──────────────────────────────────────────────────────────────
+#  Shared Memory Ring Buffer (Tear-Free)
+# ──────────────────────────────────────────────────────────────
+class SharedRingBuffer:
+    def __init__(self, size: int):
+        self._size = size
+        self._buf = mp.Array(ctypes.c_float, size, lock=False)
+        self._head = mp.Value(ctypes.c_int, 0, lock=False)
+
+    def append(self, value: float):
+        h = self._head.value
+        self._buf[h] = value
+        self._head.value = (h + 1) % self._size
+
+    def extend(self, values: np.ndarray):
+        h = self._head.value
+        n = len(values)
+        if n == 0: return
+        snapshot = np.frombuffer(self._buf, dtype=np.float32)
+        
+        if h + n <= self._size:
+            snapshot[h:h+n] = values
+        else:
+            overflow = (h + n) % self._size
+            snapshot[h:] = values[:self._size - h]
+            snapshot[:overflow] = values[self._size - h:]
+            
+        self._head.value = (h + n) % self._size
+
+    def read_latest(self, count: int) -> np.ndarray:
+        h = self._head.value
+        safe_head = (h - 2) % self._size
+        
+        snapshot = np.frombuffer(self._buf, dtype=np.float32)
+        
+        if safe_head >= count:
+            return snapshot[safe_head - count : safe_head].copy()
+        else:
+            part1 = snapshot[self._size - (count - safe_head):]
+            part2 = snapshot[:safe_head]
+            return np.concatenate((part1, part2))
+
+# ──────────────────────────────────────────────────────────────
+#  1. Acquisition Process (Hardware Level - Core 3)
+# ──────────────────────────────────────────────────────────────
+def acquisition_worker(raw_buffers, sample_count, running_flag):
+    import spidev
+    import pigpio  
+    import RPi.GPIO as GPIO
+    import gc
+    
+    gc.disable()
+    
+    try:
+        os.sched_setaffinity(0, {3})
+        param = os.sched_param(99)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+    except Exception:
+        pass 
+        
+    os.system("echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null 2>&1")
+    os.system("sudo taskset -cp 0 $(pgrep pigpiod) > /dev/null 2>&1")
+    
+    pi = pigpio.pi()
+    if not pi.connected:
+        running_flag.value = False
+        return
+
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(RESET, GPIO.OUT)
+    GPIO.setup(BUSY, GPIO.IN)
+
+    spi = spidev.SpiDev()
+    spi.open(0, 0)
+    spi.max_speed_hz = 10_000_000 
+    spi.mode = 0b10
+
+    GPIO.output(RESET, GPIO.HIGH)
+    time.sleep(0.001)
+    GPIO.output(RESET, GPIO.LOW)
+
+    _UNPACK = struct.Struct('>8h')
+
+    pi.hardware_PWM(CONVST, SAMPLING_RATE, 500000)
+
+    while running_flag.value:
+        while GPIO.input(BUSY) == GPIO.LOW:
+            if not running_flag.value: break
+              
+        while GPIO.input(BUSY) == GPIO.HIGH:
+            pass 
+
+        raw_data = spi.readbytes(BYTES_PER_SAMPLE)
+        ch_raw = _UNPACK.unpack(bytes(raw_data))
+        
+        for ch in range(NUM_CHANNELS): 
+            v = (ch_raw[ch] / 32768.0) * VREF
+            raw_buffers[ch].append(v)
+
+        sample_count.value += 1
+
+    pi.hardware_PWM(CONVST, 0, 0) 
+    pi.stop()                     
+    spi.close()
+    GPIO.cleanup()
+    os.system("echo ondemand | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null 2>&1")
+
+# ──────────────────────────────────────────────────────────────
+#  2. DSP Process (Filtering & Decimation - Core 2)
+# ──────────────────────────────────────────────────────────────
+def dsp_worker(raw_buffers, processed_buffers, running_flag):
+    import os
+    import numpy as np
+    import scipy.signal as signal
+    import time
+    import gc
+    
+    gc.disable()
+
+    try:
+        os.sched_setaffinity(0, {2})
+        param = os.sched_param(98)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+    except Exception:
+        pass
+
+    raw_size = raw_buffers[0]._size
+    last_heads = [0] * NUM_CHANNELS
+    
+    fs_raw = float(SAMPLING_RATE) 
+    fs_dec = fs_raw / 3.0         
+
+    sos_bp = signal.butter(4, [20.0, 500.0], btype='bandpass', fs=fs_raw, output='sos')
+    zi_bp_base = signal.sosfilt_zi(sos_bp)
+
+    target_freqs = [50.0, 100.0, 150.0, 200.0]
+    Qs = [8.0, 30.0, 30.0, 30.0] 
+    
+    sos_notches = []
+    for f0, q in zip(target_freqs, Qs):
+        b, a = signal.iirnotch(f0, q, fs=fs_dec) 
+        sos_notches.append(signal.tf2sos(b, a))
+        
+    master_notch_sos = np.vstack(sos_notches)
+    zi_notch_base = signal.sosfilt_zi(master_notch_sos)
+
+    zi_bp_states = [None] * NUM_CHANNELS
+    zi_notch_states = [None] * NUM_CHANNELS
+    filters_initialized = [False] * NUM_CHANNELS
+
+    while running_flag.value:
+        for ch in range(NUM_CHANNELS):
+            current_head = raw_buffers[ch]._head.value
+            last_head = last_heads[ch]
+            
+            if current_head == last_head: continue
+            
+            new_count = (current_head - last_head) if current_head > last_head else (raw_size - last_head + current_head)
+            processed_count = (new_count // 3) * 3
+            
+            if processed_count > 0:
+                raw_snap = np.frombuffer(raw_buffers[ch]._buf, dtype=np.float32)
+                chunk = (raw_snap[last_head : last_head + processed_count].copy() if last_head + processed_count <= raw_size 
+                         else np.concatenate((raw_snap[last_head:], raw_snap[:(last_head + processed_count) % raw_size])))
+                
+                chunk_64 = chunk.astype(np.float64)
+
+                if not filters_initialized[ch]:
+                    zi_bp_states[ch] = zi_bp_base * chunk_64[0]
+                    filters_initialized[ch] = True
+
+                filtered_bp, zi_bp_states[ch] = signal.sosfilt(sos_bp, chunk_64, zi=zi_bp_states[ch])
+                decimated_chunk = filtered_bp[::3]
+                
+                if zi_notch_states[ch] is None:
+                    zi_notch_states[ch] = zi_notch_base * decimated_chunk[0]
+
+                filtered_final, zi_notch_states[ch] = signal.sosfilt(master_notch_sos, decimated_chunk, zi=zi_notch_states[ch])
+                
+                processed_buffers[ch].extend(filtered_final.astype(np.float32))
+                last_heads[ch] = (last_head + processed_count) % raw_size
+        
+        time.sleep(0.005)
+
+# ──────────────────────────────────────────────────────────────
+#  3. Independent ML Inference Process (Core 1)
+# ──────────────────────────────────────────────────────────────
+def inference_worker(processed_buffers, prediction_queue, running_flag):
+    import os
+    import time
+    import numpy as np
+    import collections
+    
+    try:
+        os.sched_setaffinity(0, {1})
+    except Exception:
+        pass
+
+    try:
+        model = joblib.load(MODEL_FILE)
+        scaler = joblib.load(SCALER_FILE)
+        model_loaded = True
+    except Exception as e:
+        print(f"[ML Engine] Failed to load model/scaler: {e}")
+        model_loaded = False
+
+    def extract_features(window):
+        features = []
+        for ch in range(3):
+            channel_data = window[:, ch]
+            mav = np.mean(np.abs(channel_data))
+            rms = np.sqrt(np.mean(channel_data**2))
+            wl = np.sum(np.abs(np.diff(channel_data)))
+            zc = np.sum(np.diff(np.sign(channel_data)) != 0)
+            features.extend([mav, rms, wl, zc])
+        return np.array(features)
+
+    # --- Post-Processing State Machine Init ---
+    BUFFER_SIZE = int(VOTING_WINDOW_SEC / 0.05)
+    if BUFFER_SIZE < 1: BUFFER_SIZE = 1
+    prediction_history = collections.deque(maxlen=BUFFER_SIZE)
+    current_stable_state = 0
+    lock_until_time = 0.0
+
+    # --- Firewall Init (Time-Gated Debouncing) ---
+    RMS_HISTORY_SIZE = 10
+    rms_history = collections.deque(maxlen=RMS_HISTORY_SIZE)
+    activation_history = collections.deque(maxlen=RMS_HISTORY_SIZE)
+
+    while running_flag.value:
+        time.sleep(0.05) 
+        
+        if not model_loaded:
+            continue
+
+        data_ch1 = processed_buffers[TARGET_CHANNELS_IDX[0]].read_latest(INFERENCE_WINDOW_SIZE)
+        data_ch2 = processed_buffers[TARGET_CHANNELS_IDX[1]].read_latest(INFERENCE_WINDOW_SIZE)
+        data_ch3 = processed_buffers[TARGET_CHANNELS_IDX[2]].read_latest(INFERENCE_WINDOW_SIZE)
+
+        if len(data_ch1) < INFERENCE_WINDOW_SIZE or len(data_ch2) < INFERENCE_WINDOW_SIZE or len(data_ch3) < INFERENCE_WINDOW_SIZE:
+            continue
+
+        # حساب الـ RMS للإشارة الخام لمقارنته بالـ Threshold
+        rms1 = np.sqrt(np.mean(data_ch1**2))
+        rms2 = np.sqrt(np.mean(data_ch2**2))
+        rms3 = np.sqrt(np.mean(data_ch3**2))
+
+        ch1_active = rms1 >= RMS_THRESH_CH1
+        ch2_active = rms2 >= RMS_THRESH_CH2
+        ch3_active = rms3 >= RMS_THRESH_CH3
+        is_currently_active = ch1_active or ch2_active or ch3_active
+        current_max_rms = max(rms1, rms2, rms3)
+
+        rms_history.append(current_max_rms)
+        activation_history.append(is_currently_active)
+
+        raw_pred = 0
+        valid_activation = False
+
+        if current_stable_state == 0:
+            # نحن في وضع الـ REST، تطبيق جدار الحماية (Firewall) الصارم
+            if len(activation_history) == RMS_HISTORY_SIZE:
+                active_count = sum(activation_history)
+                rms_ptp = np.ptp(rms_history)
+                rms_std = np.std(rms_history)
+
+                # شرط الاستمرارية (7 من 10) + تحليل التباين لمنع النبضات العابرة
+                if active_count >= 7 and rms_ptp < 0.4 and rms_std < 0.15:
+                    valid_activation = True
+        else:
+            # النظام بالفعل في حالة حركة، نعتمد على النشاط الحالي
+            if is_currently_active:
+                valid_activation = True
+
+        if valid_activation:
+            window = np.column_stack((data_ch1, data_ch2, data_ch3))
+            
+            # 🔴 الإصلاح الجوهري: توحيد مقياس الإشارة بنفس طريقة كود التدريب بالضبط
+            window = window / MEAN_SCALE
+            
+            features = extract_features(window).reshape(1, -1)
+            features_scaled = scaler.transform(features)
+            
+            pred = model.predict(features_scaled)[0]
+            raw_pred = int(pred) + 1 
+        else:
+            raw_pred = 0
+
+        # --- Post-Processing Stabilization Engine ---
+        prediction_history.append(raw_pred)
+        current_time = time.time()
+
+        if current_time < lock_until_time:
+            prediction_queue.put(current_stable_state)
+            continue
+
+        total_votes = len(prediction_history)
+        if total_votes == 0:
+            continue
+
+        counts = {i: 0 for i in range(6)}
+        for p in prediction_history:
+            counts[p] += 1
+
+        new_state = current_stable_state
+        resolved = False
+
+        # 1. حماية الحركات المستقرة (3, 4, 5)
+        for move in [3, 4, 5]:
+            if counts[move] / total_votes >= STABILITY_THRESHOLD:
+                new_state = move
+                resolved = True
+                break
+
+        # 2. معالجة اللخبطة بين (0, 1, 2)
+        if not resolved:
+            ratio_1 = counts[1] / total_votes
+            ratio_2 = counts[2] / total_votes
+            
+            if ratio_1 >= 0.25:
+                new_state = 1
+            elif ratio_1 < 0.25 and ratio_2 < 0.25:
+                new_state = 0
+            else:
+                new_state = 2
+
+        # 3. تطبيق الحالة وتفعيل القفل
+        if new_state != current_stable_state:
+            current_stable_state = new_state
+            lock_until_time = current_time + COOLDOWN_SEC
+
+        prediction_queue.put(current_stable_state)
+
+# ──────────────────────────────────────────────────────────────
+#  4. Main GUI Window
+# ──────────────────────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("sEMG Live Prediction System")
+        self.resize(1100, 600)
+
+        self._raw_buffers = [SharedRingBuffer(RAW_BUFFER_CAPACITY) for _ in range(NUM_CHANNELS)]
+        self._processed_buffers = [SharedRingBuffer(PROCESSED_BUFFER_CAPACITY) for _ in range(NUM_CHANNELS)]
+        
+        self._active_ch = 0
+        
+        self._sample_count = mp.Value(ctypes.c_int, 0, lock=False)
+        self._running_flag = mp.Value(ctypes.c_bool, True, lock=False)
+        self._prediction_queue = mp.Queue()
+
+        pg.setConfigOption('background', '#1a1a2e')
+        pg.setConfigOption('foreground', '#e0e0e0')
+
+        central = QWidget() 
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        
+        # --- Control & Info Panel ---
+        ctrl_layout = QGridLayout()
+        
+        lbl_ch = QLabel("Display Channel:")
+        self._combo = QComboBox()
+        for i in range(NUM_CHANNELS):
+            self._combo.addItem(f"CH {i+1}")
+        self._combo.currentIndexChanged.connect(self._on_channel_changed)
+        
+        lbl_x = QLabel("X-Scale (Time Base):")
+        self._x_slider = QSlider(Qt.Horizontal)
+        self._x_slider.setRange(100, MAX_DISPLAY) 
+        self._x_slider.setValue(1000) 
+        self._x_slider.valueChanged.connect(self._update_plot_ranges)
+
+        lbl_y = QLabel("Y-Scale (Voltage):")
+        self._y_slider = QSlider(Qt.Horizontal)
+        self._y_slider.setRange(1, 50) 
+        self._y_slider.setValue(50)    
+        self._y_slider.valueChanged.connect(self._update_plot_ranges)
+
+        self._rate_lbl = QLabel("0 Hz (Raw HW)")
+        self._rate_lbl.setStyleSheet("color:#50fa7b; font-weight:bold; font-size:14px;")
+
+        self._rms_lbl = QLabel("Live RMS: 0.0000 V")
+        self._rms_lbl.setStyleSheet("color:#ffb86c; font-weight:bold; font-size:14px;")
+
+        ctrl_layout.addWidget(lbl_ch, 0, 0)
+        ctrl_layout.addWidget(self._combo, 0, 1)
+        ctrl_layout.addWidget(lbl_x, 0, 2)
+        ctrl_layout.addWidget(self._x_slider, 0, 3)
+        ctrl_layout.addWidget(self._rate_lbl, 0, 4, Qt.AlignRight | Qt.AlignVCenter)
+        
+        ctrl_layout.addWidget(lbl_y, 1, 0)
+        ctrl_layout.addWidget(self._y_slider, 1, 1)
+        ctrl_layout.addWidget(self._rms_lbl, 1, 4, Qt.AlignRight | Qt.AlignVCenter)
+
+        # --- AI Prediction Display ---
+        self._prediction_lbl = QLabel("REST")
+        self._prediction_lbl.setAlignment(Qt.AlignCenter)
+        self._prediction_lbl.setFont(QFont("Arial", 40, QFont.Bold))
+        self._prediction_lbl.setStyleSheet("color:#bd93f9; background-color:#282a36; border-radius: 10px; padding: 20px;")
+        
+        root.addLayout(ctrl_layout)
+        root.addWidget(self._prediction_lbl)
+
+        # --- Plot Area ---
+        self._plot_widget = pg.PlotWidget()
+        self._plot_widget.setLabel('left',  'Voltage', units='V')
+        self._plot_widget.setLabel('bottom', 'Samples (Processed @ 2000Hz)')
+        self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_widget.setMouseEnabled(x=False, y=False) 
+        
+        self._curve = self._plot_widget.plot(pen=pg.mkPen(color='#8be9fd', width=1.8)) 
+        root.addWidget(self._plot_widget)
+
+        # --- Process Launch ---
+        self._acq_process = mp.Process(target=acquisition_worker, args=(self._raw_buffers, self._sample_count, self._running_flag))
+        self._dsp_process = mp.Process(target=dsp_worker, args=(self._raw_buffers, self._processed_buffers, self._running_flag))
+        self._inf_process = mp.Process(target=inference_worker, args=(self._processed_buffers, self._prediction_queue, self._running_flag))
+        
+        self._acq_process.start()
+        self._dsp_process.start()
+        self._inf_process.start()
+
+        # --- Timers ---
+        self._plot_timer = QTimer(self)
+        self._plot_timer.setInterval(PLOT_INTERVAL)
+        self._plot_timer.timeout.connect(self._refresh_plot)
+        self._plot_timer.start()
+
+        self._rate_timer = QTimer(self)
+        self._rate_timer.setInterval(1000)
+        self._rate_timer.timeout.connect(self._update_rate) 
+        self._rate_timer.start()
+
+        self._pred_timer = QTimer(self)
+        self._pred_timer.setInterval(50)
+        self._pred_timer.timeout.connect(self._poll_prediction)
+        self._pred_timer.start()
+
+        self._x = np.arange(MAX_DISPLAY, dtype=np.float32)
+        self._update_plot_ranges() 
+
+    def _poll_prediction(self):
+        latest_pred = None
+        while not self._prediction_queue.empty():
+            latest_pred = self._prediction_queue.get_nowait()
+            
+        if latest_pred is not None:
+            if latest_pred == 0:
+                self._prediction_lbl.setText("REST")
+                self._prediction_lbl.setStyleSheet("color:#6272a4; background-color:#282a36; border-radius: 10px; padding: 20px;")
+            else:
+                self._prediction_lbl.setText(f"MOVEMENT {latest_pred}")
+                self._prediction_lbl.setStyleSheet("color:#50fa7b; background-color:#282a36; border-radius: 10px; padding: 20px;")
+
+    def _update_plot_ranges(self):
+        x_max = self._x_slider.value()
+        y_max = self._y_slider.value() / 10.0 
+        
+        self._plot_widget.setXRange(0, x_max, padding=0)
+        self._plot_widget.setYRange(-y_max, y_max, padding=0)
+
+    def _refresh_plot(self):
+        data = self._processed_buffers[self._active_ch].read_latest(MAX_DISPLAY + 500)
+        
+        if len(data) >= 400:
+            rms_val = np.sqrt(np.mean(data[-400:]**2))
+            self._rms_lbl.setText(f"Live RMS (Ch{self._active_ch+1}): {rms_val:.4f} V")
+
+        dc_offset = np.mean(data)
+        crossings = np.where((data[:-1] < dc_offset) & (data[1:] >= dc_offset))[0]
+        
+        valid_crossings = [c for c in crossings if (len(data) - c) >= MAX_DISPLAY]
+        
+        if valid_crossings:
+            trig_idx = valid_crossings[-1]
+            plot_data = data[trig_idx : trig_idx + MAX_DISPLAY]
+        else:
+            plot_data = data[-MAX_DISPLAY:]
+
+        self._curve.setData(self._x, plot_data) 
+
+    def _on_channel_changed(self, idx: int):
+        self._active_ch = idx
+
+    def _update_rate(self):
+        hz = self._sample_count.value
+        self._sample_count.value = 0
+        self._rate_lbl.setText(f"{hz} Hz (Raw HW)")
+
+    def closeEvent(self, event):
+        self._plot_timer.stop()
+        self._rate_timer.stop()
+        self._pred_timer.stop()
+        self._running_flag.value = False
+        
+        self._acq_process.join(timeout=1.0)
+        self._dsp_process.join(timeout=1.0)
+        self._inf_process.join(timeout=1.0)
+        event.accept()
+
+# ──────────────────────────────────────────────────────────────
+#  Entry Point (Core 0)
+# ──────────────────────────────────────────────────────────────
+def main():
+    try:
+        os.sched_setaffinity(0, {0})
+    except Exception:
+        pass
+
+    mp.freeze_support()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = MainWindow()
+    win.show()
+    exit_code = app.exec()
+    sys.exit(exit_code)
+
+if __name__ == "__main__":
+    main()
