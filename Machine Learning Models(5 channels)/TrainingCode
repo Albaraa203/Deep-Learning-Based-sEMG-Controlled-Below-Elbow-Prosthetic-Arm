@@ -1,0 +1,111 @@
+import os
+import h5py
+import joblib
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+class ModelTrainerProBW:
+    def __init__(self):
+        # ---------------------------------------------------------
+        # مسار الداتا المدمجة ومكان الحفظ داخل bw
+        # ---------------------------------------------------------
+        self.data_dir = r"D:\6to9_Journy\PythonProject\EMGdata\windowed\bw"
+        self.features_file = os.path.join(self.data_dir, "AllFeatures_Combined_BW.h5")
+        self.target_names = [f"Movement {i+1}" for i in range(5)]
+
+    def plot_confusion_matrix(self, y_true, y_pred, model_name, save_dir):
+        cm = confusion_matrix(y_true, y_pred)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=self.target_names, yticklabels=self.target_names)
+        plt.title(f'Confusion Matrix - {model_name}')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+
+        plot_path = os.path.join(save_dir, f"CM_{model_name.replace(' ', '_')}.png")
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+        print(f"📸 تم حفظ صورة مصفوفة الارتباك في: {plot_path}")
+
+    def run(self):
+        print(f"📥 Loading features from: {self.features_file}")
+        if not os.path.exists(self.features_file):
+            raise FileNotFoundError("ملف الميزات غير موجود! تأكد من تشغيل كود دمج bw أولاً.")
+
+        with h5py.File(self.features_file, 'r') as f:
+            X = f['X_features'][:]
+            Y = f['Y'][:]
+
+        print(f"📊 Dataset Shape: X={X.shape}, Y={Y.shape}")
+
+        print("🔪 Splitting data (80% Train, 20% Test)...")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, Y, test_size=0.2, random_state=42, stratify=Y
+        )
+
+        rf_model = RandomForestClassifier(n_estimators=100, max_depth=10, min_samples_split=5, random_state=42, n_jobs=-1)
+        svm_model = SVC(kernel='rbf', C=10, gamma='scale', probability=True, random_state=42)
+        mix_model = VotingClassifier(
+            estimators=[('rf', rf_model), ('svm', svm_model)],
+            voting='soft',
+            n_jobs=-1
+        )
+
+        models = {
+            "Random_Forest": rf_model,
+            "SVM_RBF": svm_model,
+            "Mixed_Ensemble": mix_model
+        }
+
+        print("="*50)
+        print("🚀 بدء التدريب وتصدير النماذج داخل فولدر bw 🚀")
+        print("="*50)
+
+        for name, model in models.items():
+            print(f"\n⚙️ Training {name}...")
+
+            model_dir = os.path.join(self.data_dir, f"{name}_Model")
+            os.makedirs(model_dir, exist_ok=True)
+
+            cv_scores = cross_val_score(model, X_train, y_train, cv=5, n_jobs=-1)
+            print(f"   -> 5-Fold CV Accuracy: {cv_scores.mean()*100:.2f}% (+/- {cv_scores.std()*2*100:.2f}%)")
+
+            model.fit(X_train, y_train)
+
+            train_acc = accuracy_score(y_train, model.predict(X_train))
+            y_pred = model.predict(X_test)
+            test_acc = accuracy_score(y_test, y_pred)
+
+            print(f"   -> Training Accuracy : {train_acc * 100:.2f}%")
+            print(f"   -> Testing Accuracy  : {test_acc * 100:.2f}%")
+
+            if (train_acc - test_acc) > 0.10:
+                print("   ⚠️ تحذير: يوجد Overfitting محتمل في هذا الموديل!")
+            else:
+                print("   ✅ الموديل مستقر ولا يوجد Overfitting.")
+
+            report = classification_report(y_test, y_pred, target_names=self.target_names)
+            report_path = os.path.join(model_dir, "Classification_Report.txt")
+            with open(report_path, "w", encoding="utf-8") as rep_file:
+                rep_file.write(f"Classification Report for {name}:\n\n")
+                rep_file.write(report)
+            print(f"📄 تم حفظ تقرير الدقة في: {report_path}")
+
+            self.plot_confusion_matrix(y_test, y_pred, name, model_dir)
+
+            export_path = os.path.join(model_dir, "model.pkl")
+            joblib.dump(model, export_path)
+            print(f"💾 تم حفظ الموديل الجاهز للعمل في: {export_path}")
+            print("-" * 50)
+
+        print("\n🏆 اكتملت العملية! يمكنك الآن نقل أي 'model.pkl' مع 'final_standard_scaler_bw.pkl' إلى الراسبيري باي.")
+
+if __name__ == "__main__":
+    trainer = ModelTrainerProBW()
+    trainer.run()
