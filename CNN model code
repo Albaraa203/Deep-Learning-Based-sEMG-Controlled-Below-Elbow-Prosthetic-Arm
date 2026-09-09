@@ -1,0 +1,17 @@
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(8, 600, 1)),
+    tf.keras.layers.Conv2D(32, (3, 3), padding='same', activation='relu', name='conv2d_1'),
+    tf.keras.layers.BatchNormalization(name='bn_1'),
+    tf.keras.layers.Conv2D(64, (3, 3), padding='same', activation='relu', name='conv2d_2'),
+    tf.keras.layers.BatchNormalization(name='bn_2'),
+    tf.keras.layers.Conv2D(64, (3, 3), padding='same', activation='relu', name='conv2d_3'),
+    tf.keras.layers.BatchNormalization(name='bn_3'),
+    tf.keras.layers.GlobalAveragePooling2D(name='gap'),
+    tf.keras.layers.Reshape((1, 1, 64), name='reshape_for_1x1'),
+    tf.keras.layers.Conv2D(16, (1, 1), activation='relu', name='conv2d_1x1'),
+    tf.keras.layers.BatchNormalization(name='bn_1x1'),
+    tf.keras.layers.Flatten(name='flatten_after_1x1'),
+    tf.keras.layers.Dropout(0.1, name='dropout'),
+    tf.keras.layers.Dense(12, activation='softmax', name='output')
+])
+
