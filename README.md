@@ -28,12 +28,13 @@ To achieve a stable sampling frequency of 6000 Hz and real-time inference withou
 ## 📂 Repository Structure & Modules
 
 ### 1. `Data_Collector/`
-The clinical dataset acquisition suite designed to safely guide subjects through multi-movement, multi-round recording sessions.
-*   **`AADataCollector1.py`**: Features a state-machine-driven PySide6 GUI, live signal plotting, automatic data trimming (ignoring transient muscle start-up noise), and asynchronous dataset logging directly into structured **HDF5 (`.h5`)** files containing subject metadata and labeled sEMG streams.
+The clinical dataset acquisition suite designed to safely guide subjects through multi-movement, multi-round recording sessions. Features a state-machine-driven PySide6 GUI, live signal plotting, automatic data trimming (ignoring transient muscle start-up noise), and asynchronous dataset logging directly into structured **HDF5 (`.h5`)** files containing subject metadata and labeled sEMG streams.
 
 ### 2. `Predictor/`
-The real-time edge inference engine responsible for translating live muscle contractions into discrete prosthetic movement commands.
-*   **`AAPredictor.py`**: Loads serialized machine learning models (`model.pkl`) and scalers (`standard_scaler.pkl`) via `joblib`. It computes time-domain features over sliding windows and outputs classification states.
+The real-time edge inference engine responsible for translating live muscle contractions into discrete prosthetic movement commands. Loads serialized machine learning models and scalers via `joblib`, computes time-domain features over sliding windows, and outputs stabilized classification states.
+
+### 3. `Machine Learning Models(5 channels)/`
+Houses the training pipelines, exploratory data analysis scripts, and serialized model weights optimized specifically for 5-channel sEMG feature extraction and multi-class gesture classification.
 
 ---
 
